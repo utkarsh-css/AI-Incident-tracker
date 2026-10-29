@@ -1,0 +1,7 @@
+streamlit>=1.42,<2
+openai>=1.66,<3
+pydantic>=2.7,<3
+python-dotenv>=1,<2
+pytest>=8.3,<10
+chromadb>=1.5,<2
+rank-bm25>=0.2.2,<0.3
