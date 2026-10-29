@@ -1,0 +1,7 @@
+Authentication and access failures
+
+For repeated authentication failures, compare the affected users, clients, and start time. Check identity-provider availability, account status, token expiry, clock skew, and recent identity-policy or application configuration changes.
+
+Distinguish invalid credentials, expired tokens, authorization denials, and identity-provider outages using the exact sanitized status and timestamp. A 401 or 403 response does not by itself establish an account compromise or a single root cause.
+
+Never request or expose passwords, API keys, bearer tokens, session cookies, or recovery codes. Follow the organization's approved identity verification and escalation process before changing access or resetting credentials.

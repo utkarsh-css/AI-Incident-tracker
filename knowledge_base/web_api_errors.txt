@@ -1,0 +1,7 @@
+Web and API error responses
+
+For elevated HTTP 5xx responses, compare request rates, latency, and error rates across affected routes and service instances. Record representative timestamps and request identifiers, then correlate them with deployments and upstream dependency health.
+
+For intermittent 502 or 503 responses, investigate load balancer health checks, upstream connectivity, saturation, and dependency timeouts. A gateway response is evidence of a failed request path, not proof of which component caused it.
+
+For 4xx responses, inspect sanitized request metadata and application validation or authorization outcomes. Avoid copying credentials, personal data, or full request bodies into incident notes.

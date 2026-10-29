@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "cases": [
+    {"id": "db-01", "query": "The billing service cannot establish database connections and reports repeated timeouts.", "expected_sources": ["database_connectivity.txt"], "acceptance_required": true},
+    {"id": "db-02", "query": "Could connection pool exhaustion or a database connection limit explain stalled requests?", "expected_sources": ["database_connectivity.txt"], "acceptance_required": true},
+    {"id": "db-03", "query": "Name resolution and latency to the SQL endpoint changed after a configuration update.", "expected_sources": ["database_connectivity.txt"], "acceptance_required": true},
+    {"id": "web-01", "query": "The gateway returns intermittent 502 and 503 responses from upstream services.", "expected_sources": ["web_api_errors.txt"], "acceptance_required": true},
+    {"id": "web-02", "query": "Customer API latency and server-side failures increased during a traffic spike.", "expected_sources": ["web_api_errors.txt"], "acceptance_required": true},
+    {"id": "web-03", "query": "How should we investigate unhealthy load balancer targets and dependency timeouts?", "expected_sources": ["web_api_errors.txt"], "acceptance_required": true},
+    {"id": "auth-01", "query": "Users receive unauthorized responses because identity tokens may have expired.", "expected_sources": ["authentication.txt"], "acceptance_required": true},
+    {"id": "auth-02", "query": "Login attempts are denied and the identity provider might be unavailable.", "expected_sources": ["authentication.txt"], "acceptance_required": true},
+    {"id": "auth-03", "query": "Several people cannot authenticate after a possible access policy change.", "expected_sources": ["authentication.txt"], "acceptance_required": true},
+    {"id": "mixed-01", "query": "A web API returns 503 while its database dependency is timing out.", "expected_sources": ["web_api_errors.txt", "database_connectivity.txt"], "acceptance_required": false},
+    {"id": "mixed-02", "query": "Authentication denials and elevated API errors began after a deployment.", "expected_sources": ["authentication.txt", "web_api_errors.txt"], "acceptance_required": false},
+    {"id": "mixed-03", "query": "Requests fail at the gateway and database connections are saturated.", "expected_sources": ["web_api_errors.txt", "database_connectivity.txt"], "acceptance_required": false},
+    {"id": "none-01", "query": "Purple elephants enjoy violin practice under a blue moon.", "expected_sources": [], "acceptance_required": true},
+    {"id": "none-02", "query": "How do I bake sourdough bread and maintain a starter?", "expected_sources": [], "acceptance_required": true},
+    {"id": "none-03", "query": "What are the best hiking trails for a weekend camping trip?", "expected_sources": [], "acceptance_required": true}
+  ]
+}

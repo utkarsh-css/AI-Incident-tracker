@@ -1,0 +1,7 @@
+Database connection timeouts
+
+If an application reports database connection timeouts, first compare the incident start time with database health dashboards and deployment or configuration changes. Confirm whether the issue affects one application instance, one network segment, or all clients before identifying a cause.
+
+Check the database endpoint, DNS resolution, connection pool saturation, maximum connection limits, and recent credential or network-policy changes. A timeout alone does not prove the database is unavailable; it may also reflect network latency or an application-side pool problem.
+
+Use read-only checks and the team's approved operational process. Do not rotate credentials, restart services, or change firewall rules until the owning team confirms the impact and change approval.
