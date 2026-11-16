@@ -98,3 +98,65 @@ def test_log_evidence_is_sanitized_line_addressable_and_bounded():
     assert all(len(record.excerpt) <= 500 for record in records)
     assert records[-1].truncated
     assert "topsecret" not in " ".join(record.excerpt for record in records)
+
+
+@pytest.mark.parametrize(
+    "source, secret",
+    [
+        ("DB_PASSWORD=hunter2", "hunter2"),
+        ("access_token=abc123xyz", "abc123xyz"),
+        ("refresh_token: zzz999", "zzz999"),
+        ("aws_secret_access_key=wJalrXUtnFEMI/K7MDENG", "wJalrXUtnFEMI"),
+        ("X-Auth-Token: tkn999", "tkn999"),
+        ("spring.datasource.password=pw1", "pw1"),
+        ("Cookie: session=abcd1234; theme=dark", "abcd1234"),
+        ("Set-Cookie: sid=s3ss10n; HttpOnly", "s3ss10n"),
+        ("postgres://admin:S3cr3t@db.internal:5432/app", "S3cr3t"),
+        ("the password is hunter2", "hunter2"),
+    ],
+)
+def test_redacts_prefixed_names_cookies_url_credentials_and_prose(source, secret):
+    assert secret not in redact_sensitive_text(source)
+
+
+def test_url_credentials_keep_host_for_diagnosis():
+    result = redact_sensitive_text("postgres://admin:S3cr3t@db.internal:5432/app")
+    assert result == "postgres://admin:[REDACTED]@db.internal:5432/app"
+
+
+def test_private_key_block_is_masked_and_line_numbers_are_preserved():
+    source = (
+        "before\n-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkq\nhkiG9w0BAQEF\n"
+        "-----END RSA PRIVATE KEY-----\nDatabase connection timeout"
+    )
+    result = redact_sensitive_text(source)
+    assert "MIIEvQIBADANBgkq" not in result
+    assert "[REDACTED_PRIVATE_KEY]" in result
+    assert result.count("\n") == source.count("\n")
+    records = make_log_evidence(ValidatedUpload("app.log", source), "database timeout")
+    timeout_line = next(record for record in records if "timeout" in record.excerpt)
+    assert timeout_line.line_start == 6
+
+
+def test_unterminated_private_key_is_masked_to_end_of_text():
+    result = redact_sensitive_text("-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\n")
+    assert "MIIEvQIBADANBgkq" not in result
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["2026-11-16 ERROR db timeout after 30s", "HTTP 503 from upstream", "Users see token expired errors"],
+)
+def test_ordinary_incident_text_is_not_redacted(text):
+    assert redact_sensitive_text(text) == text
+
+
+@pytest.mark.parametrize("unit", ["a.", "x-", "a@", "token"])
+def test_redaction_is_fast_on_adversarial_one_mib_input(unit):
+    import time
+
+    text = unit * (MAX_UPLOAD_BYTES // len(unit))
+    started = time.perf_counter()
+    redact_sensitive_text(text)
+    # The previous unanchored email pattern took minutes on this input.
+    assert time.perf_counter() - started < 5

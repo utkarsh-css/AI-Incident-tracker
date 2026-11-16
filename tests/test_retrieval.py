@@ -45,6 +45,50 @@ def test_keyword_unrelated_query_returns_none():
     assert keyword_search("purple elephants enjoy violin practice", "knowledge_base") == []
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        # Each shares exactly one word ("error" / "failed") with web_api_errors.txt.
+        "The office printer shows a paper jam error",
+        "Disk usage on the file server reached 100 percent and backups failed",
+    ],
+)
+def test_off_topic_incident_sharing_one_generic_term_returns_none(query):
+    assert keyword_search(query, "knowledge_base") == []
+
+
+def test_bm25plus_lower_bound_does_not_admit_chunks_without_query_terms(tmp_path):
+    # BM25Plus gives every document a positive score when a query term exists anywhere in the
+    # corpus; only the chunk that actually contains the terms may be returned.
+    (tmp_path / "db.txt").write_text("Database connection timeout and pool saturation.", encoding="utf-8")
+    (tmp_path / "web.txt").write_text("Gateway returned HTTP 503 from upstream.", encoding="utf-8")
+    (tmp_path / "auth.txt").write_text("Identity provider rejected expired tokens.", encoding="utf-8")
+    matches = keyword_search("database connection timeout", tmp_path)
+    assert [match.source_path for match in matches] == ["db.txt"]
+
+
+def test_single_shared_term_is_not_enough_for_a_keyword_match(tmp_path):
+    (tmp_path / "db.txt").write_text("Database connection timeout guidance.", encoding="utf-8")
+    assert keyword_search("printer timeout", tmp_path) == []
+    assert keyword_search("database timeout", tmp_path)
+
+
+def test_tokenizer_ignores_trailing_sentence_punctuation():
+    from incident_assistant.retrieval import tokenize
+
+    assert tokenize("Timeouts. identity-policy /api/v1/") == ["timeouts", "identity-policy", "api/v1"]
+
+
+def test_hybrid_off_topic_query_without_dense_match_returns_none():
+    matches = hybrid_search(
+        query="The office printer shows a paper jam error",
+        knowledge_dir="knowledge_base",
+        collection=FakeCollection([]),
+        query_embedding=[0.1, 0.2],
+    )
+    assert matches == []
+
+
 class FakeCollection:
     def __init__(self, rows):
         self.rows = rows

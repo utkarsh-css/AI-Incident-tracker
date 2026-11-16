@@ -15,6 +15,9 @@
     {"id": "mixed-03", "query": "Requests fail at the gateway and database connections are saturated.", "expected_sources": ["web_api_errors.txt", "database_connectivity.txt"], "acceptance_required": false},
     {"id": "none-01", "query": "Purple elephants enjoy violin practice under a blue moon.", "expected_sources": [], "acceptance_required": true},
     {"id": "none-02", "query": "How do I bake sourdough bread and maintain a starter?", "expected_sources": [], "acceptance_required": true},
-    {"id": "none-03", "query": "What are the best hiking trails for a weekend camping trip?", "expected_sources": [], "acceptance_required": true}
+    {"id": "none-03", "query": "What are the best hiking trails for a weekend camping trip?", "expected_sources": [], "acceptance_required": true},
+    {"id": "none-it-01", "query": "The office printer shows a paper jam error on the third floor.", "expected_sources": [], "acceptance_required": true},
+    {"id": "none-it-02", "query": "Disk usage on the file server reached 100 percent and nightly backups failed.", "expected_sources": [], "acceptance_required": true},
+    {"id": "none-it-03", "query": "A laptop battery will not charge after a firmware update.", "expected_sources": [], "acceptance_required": true}
   ]
 }

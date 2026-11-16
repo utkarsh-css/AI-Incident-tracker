@@ -34,12 +34,12 @@ The tests use fake API responses and make no network calls. To run the retrieval
 python -m incident_assistant.evaluate --live
 ```
 
-That command sends the 15 evaluation queries to the Embeddings API and may incur usage charges. Live analysis is sent to OpenAI only after the user submits a valid incident using **Analyze incident**.
+That command sends the 18 evaluation queries to the Embeddings API and may incur usage charges. Live analysis is sent to OpenAI only after the user submits a valid incident using **Analyze incident**.
 
 ## What the demo does
 
 1. Validates a required incident description up to 10,000 characters and an optional UTF-8 `.log` or `.txt` upload up to 1 MiB.
-2. Masks common credential patterns, JWT-like values, and email addresses before the app displays or submits log excerpts.
+2. Masks common credential patterns before the app displays or submits incident text or log excerpts: `key=value` secrets including prefixed names such as `DB_PASSWORD` or `access_token`, `Authorization`/bearer values, cookie headers, credentials in URLs, private-key blocks, JWT-like values, common provider token formats, and email addresses. Masking keeps line numbers aligned with the uploaded file.
 3. Uses BM25 over current local chunks for a no-key preview; after explicit analysis submission, it adds dense semantic search from the persistent Chroma index and fuses both rankings with reciprocal rank fusion.
 4. Lets the user explicitly rebuild the index from `.txt` and `.md` documents in `knowledge_base/`. Reindexing unchanged documents makes no embedding calls; changed content is embedded and staged before the active index switches.
 5. Requests structured incident analysis and validates model evidence IDs against application-created records.
@@ -54,5 +54,5 @@ The knowledge base contains synthetic guidance about database connectivity, web/
 - Uploaded data stays in memory in this app and is not persisted locally. Sanitized incident/log content is sent to the configured OpenAI model when the user explicitly analyzes it.
 - Redaction is pattern-based, so inspect and sanitize inputs before submission.
 - Severity and causes are model-generated advisory assessments and require human verification.
-- Keyword retrieval may miss relevant documents or return weak matches. When no passage meets the threshold, the model is told there is no retrieved knowledge evidence.
+- Keyword retrieval may miss relevant documents or return weak matches. A keyword candidate must share at least two distinct non-stop-word terms with a passage, and a dense candidate must reach cosine similarity 0.35. These thresholds are uncalibrated demo defaults. When no passage qualifies, the model is told there is no retrieved knowledge evidence.
 - Index building and hybrid search use the configured OpenAI embedding model. Indexing and live evaluation require explicit user action and can incur API usage.

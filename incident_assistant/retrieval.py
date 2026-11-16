@@ -21,13 +21,20 @@ MAX_RESULTS = 3
 RRF_K = 60
 MIN_SEMANTIC_SIMILARITY = 0.35
 MIN_FUSED_SCORE = 0.016
+# BM25Plus adds a positive lower bound to every document for any query term found anywhere in the
+# corpus, so "score > 0" is not a relevance signal. A keyword candidate must instead share at least
+# this many distinct non-stop-word terms with the chunk itself.
+MIN_LEXICAL_TERM_MATCHES = 2
 _TOKEN = re.compile(r"[a-z0-9_./-]+", re.IGNORECASE)
 _STOP_WORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can",
-    "did", "do", "does", "for", "from", "had", "has", "have", "how", "i", "in",
-    "is", "it", "its", "of", "on", "or", "our", "should", "that", "the", "their",
-    "then", "there", "this", "to", "was", "we", "were", "what", "when", "where",
-    "which", "who", "will", "with", "you",
+    "a", "after", "all", "also", "an", "and", "any", "are", "as", "at", "be",
+    "been", "before", "but", "by", "can", "could", "did", "do", "does", "for",
+    "from", "had", "has", "have", "how", "i", "if", "in", "into", "is", "it",
+    "its", "may", "might", "no", "not", "of", "on", "one", "only", "or", "our",
+    "should", "since", "so", "some", "than", "that", "the", "their", "them",
+    "then", "there", "these", "they", "this", "those", "to", "until", "was",
+    "we", "were", "what", "when", "where", "which", "while", "who", "will",
+    "with", "would", "you", "your",
 }
 
 
@@ -91,7 +98,10 @@ def knowledge_evidence(passages: list[RetrievalResult]) -> list[EvidenceRecord]:
 
 
 def tokenize(text: str) -> list[str]:
-    return [term for term in _TOKEN.findall(text.lower()) if term not in _STOP_WORDS]
+    # Strip sentence punctuation so "timeouts." and "timeouts" are the same term; inner
+    # separators (e.g. "identity-policy", "/api/v1") are kept.
+    terms = (term.strip("./-") for term in _TOKEN.findall(text.lower()))
+    return [term for term in terms if term and term not in _STOP_WORDS]
 
 
 def keyword_search(
@@ -106,8 +116,13 @@ def keyword_search(
         return []
     tokenized_docs = [tokenize(chunk.text) for chunk in chunks]
     scores = BM25Plus(tokenized_docs).get_scores(query_terms)
+    distinct_query_terms = set(query_terms)
     ranked = sorted(
-        ((float(score), chunk) for score, chunk in zip(scores, chunks, strict=True) if score > 0),
+        (
+            (float(score), chunk)
+            for score, chunk, doc_terms in zip(scores, chunks, tokenized_docs, strict=True)
+            if len(distinct_query_terms.intersection(doc_terms)) >= MIN_LEXICAL_TERM_MATCHES
+        ),
         key=lambda item: (-item[0], item[1].source_path.lower(), item[1].chunk_index),
     )[:max_results]
     return [

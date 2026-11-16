@@ -12,13 +12,37 @@ MAX_INCIDENT_CHARS = 10_000
 MAX_LOG_EVIDENCE = 20
 MAX_LOG_LINE_CHARS = 500
 
+_SECRET_KEY_NAME = (
+    r"(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|access[_-]?key|"
+    r"private[_-]?key|authorization|credentials?)"
+)
+# The key name may carry a bounded prefix/suffix (DB_PASSWORD, access_token, X-Auth-Token,
+# spring.datasource.password). The lookbehind anchors matching to the start of a name token and
+# the bounded repeats keep matching linear on long uploaded lines.
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:password|passwd|pwd|api[_-]?key|access[_-]?key|secret|token|client[_-]?secret|authorization)\b[\"']?\s*[:=]\s*)(\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+    r"(?i)((?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]{0,64}?"
+    + _SECRET_KEY_NAME
+    + r"[A-Za-z0-9_.-]{0,64}[\"']?\s*[:=]\s*)(\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+)
+_SECRET_IN_PROSE = re.compile(
+    r"(?i)(\b(?:password|passphrase|passwd|pwd)\s+(?:is|was)\s+)([^\s,;]+)"
+)
+_COOKIE_HEADER = re.compile(r"(?im)(\b(?:set-)?cookie\s*:\s*)[^\r\n]+")
+_URL_CREDENTIALS = re.compile(
+    r"(?i)((?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}://[^\s:/@]{1,256}:)[^\s/@]{1,256}@"
+)
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----|.*\Z)",
+    re.DOTALL,
 )
 _AUTHORIZATION = re.compile(r"(?i)(\bauthorization\s*[:=]\s*)(?:basic|bearer)\s+[^\s,;]+")
 _BEARER = re.compile(r"(?i)(\bbearer\s+)([A-Za-z0-9._~+/=-]+)")
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b")
-_EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+# Anchored and bounded: an unanchored "\b[...]+@" rescans from every word boundary, which is
+# quadratic on long dotted or hyphenated runs in a 1 MiB upload.
+_EMAIL = re.compile(
+    r"(?<![A-Z0-9._%+-])[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,24}\b", re.IGNORECASE
+)
 _COMMON_TOKEN = re.compile(
     r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b"
 )
@@ -48,14 +72,26 @@ def validate_incident_description(description: str) -> str:
 
 
 def redact_sensitive_text(text: str) -> str:
-    """Mask common credential patterns and email addresses; this is not exhaustive."""
+    """Mask common credential patterns and email addresses; this is not exhaustive.
+
+    Line count is preserved so log evidence line numbers still match the uploaded file.
+    """
+    text = _PRIVATE_KEY_BLOCK.sub(_replace_private_key, text)
     text = _AUTHORIZATION.sub(r"\1[REDACTED]", text)
     text = _BEARER.sub(r"\1[REDACTED]", text)
+    text = _COOKIE_HEADER.sub(r"\1[REDACTED]", text)
+    text = _URL_CREDENTIALS.sub(r"\1[REDACTED]@", text)
     text = _SECRET_ASSIGNMENT.sub(_replace_secret_assignment, text)
+    text = _SECRET_IN_PROSE.sub(r"\1[REDACTED]", text)
     text = _JWT.sub("[REDACTED_JWT]", text)
     text = _COMMON_TOKEN.sub("[REDACTED_TOKEN]", text)
     text = _EMAIL.sub("[REDACTED_EMAIL]", text)
     return text
+
+
+def _replace_private_key(match: re.Match[str]) -> str:
+    # Keep the original newlines so later lines keep their line numbers.
+    return "[REDACTED_PRIVATE_KEY]" + "\n" * match.group(0).count("\n")
 
 
 def _replace_secret_assignment(match: re.Match[str]) -> str:
