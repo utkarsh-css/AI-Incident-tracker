@@ -14,28 +14,75 @@ MAX_LOG_LINE_CHARS = 500
 
 _SECRET_KEY_NAME = (
     r"(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|access[_-]?key|"
-    r"private[_-]?key|authorization|credentials?)"
+    r"private[_-]?key|account[_-]?key|authorization|credentials?|signature)"
 )
+# Words that report a credential's status rather than its value ("password is incorrect",
+# "authorization: denied", "token=expired"). They are kept so the diagnosis survives masking.
+_STATUS_WORDS = (
+    r"true|false|yes|no|null|none|expired|valid|invalid|incorrect|wrong|rejected|denied|"
+    r"required|missing|empty|blank|reset|changed|locked|revoked|accepted|unknown|bad"
+)
+# Quoted values may contain escaped quotes ("pa\"ss"). Each alternative inside the quotes starts
+# with a different character, so matching stays linear.
+_DOUBLE_QUOTED = r'"(?:[^"\\\r\n]|\\.)*"'
+_SINGLE_QUOTED = r"'(?:[^'\\\r\n]|\\.)*'"
 # The key name may carry a bounded prefix/suffix (DB_PASSWORD, access_token, X-Auth-Token,
 # spring.datasource.password). The lookbehind anchors matching to the start of a name token and
 # the bounded repeats keep matching linear on long uploaded lines.
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)((?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]{0,64}?"
     + _SECRET_KEY_NAME
-    + r"[A-Za-z0-9_.-]{0,64}[\"']?\s*[:=]\s*)(\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+    + r"[A-Za-z0-9_.-]{0,64}[\"']?\s*[:=]\s*)("
+    + _DOUBLE_QUOTED
+    + "|"
+    + _SINGLE_QUOTED
+    + r"|[^\s,;]+)"
+)
+# Command-line secrets: "--password hunter2", and MySQL's attached "-phunter2". The MySQL form is
+# matched only after a MySQL client name, because "-p" usually means "port" elsewhere.
+_CLI_SECRET_FLAG = re.compile(
+    r"(?i)((?<![A-Za-z0-9_-])--?(?:password|passwd|pass|pwd|token|secret|api[_-]?key)\s+)(?!-)(\S+)"
+)
+_MYSQL_PASSWORD_FLAG = re.compile(
+    r"(?i)(\b(?:mysql|mysqldump|mysqladmin|mariadb)\b[^\r\n]{0,200}?\s-p)([^\s-]\S*)"
+)
+# Short or generic key names (sig, sid, session IDs) are matched only as whole names, because as
+# substrings they would also hit "signal=SIGKILL", "inside=..." and similar diagnostic fields.
+_EXACT_SECRET_KEY = re.compile(
+    r"(?i)((?<![A-Za-z0-9_.-])(?:sig|sid|sessionid|session[_-]id|jsessionid|phpsessid|"
+    r"asp\.net_sessionid)[\"']?\s*[:=]\s*)("
+    + _DOUBLE_QUOTED
+    + "|"
+    + _SINGLE_QUOTED
+    + r"|[^\s,;&]+)"
 )
 _SECRET_IN_PROSE = re.compile(
-    r"(?i)(\b(?:password|passphrase|passwd|pwd)\s+(?:is|was)\s+)([^\s,;]+)"
+    r"(?i)(\b(?:password|passphrase|passwd|pwd)\s+(?:is|was)\s+)"
+    r"(?!(?:" + _STATUS_WORDS + r")\b)([^\s,;]+)"
 )
 _COOKIE_HEADER = re.compile(r"(?im)(\b(?:set-)?cookie\s*:\s*)[^\r\n]+")
 _URL_CREDENTIALS = re.compile(
-    r"(?i)((?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}://[^\s:/@]{1,256}:)[^\s/@]{1,256}@"
+    # The username may be empty, as in redis://:password@host.
+    r"(?i)((?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}://[^\s:/@]{0,256}:)[^\s/@]{1,256}@"
 )
 _PRIVATE_KEY_BLOCK = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----|.*\Z)",
     re.DOTALL,
 )
-_AUTHORIZATION = re.compile(r"(?i)(\bauthorization\s*[:=]\s*)(?:basic|bearer)\s+[^\s,;]+")
+# Mask the whole header value whatever the scheme (Bearer, Basic, Token, SSWS, ApiKey, ...):
+# an optional scheme word plus the credential after it. A following "key=value" field is never
+# taken as the credential, so "authorization=X path=/api status=500" keeps path and status.
+# Digest and AWS SigV4 values hold comma-separated parameters, so they are masked to end of line.
+_AUTHORIZATION = re.compile(
+    r"(?i)((?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]{0,32}?authorization[\"']?\s*[:=]\s*)("
+    + _DOUBLE_QUOTED
+    + "|"
+    + _SINGLE_QUOTED
+    + r"|(?:AWS4-HMAC-SHA256|Digest)\s[^\r\n]*"
+    # A status word ("authorization: denied for user bob") is not a credential; leave it.
+    + r"|(?!(?:" + _STATUS_WORDS + r")\b)"
+    + r"(?:[A-Za-z][A-Za-z0-9._-]{0,30}[ \t]+(?![A-Za-z0-9_.-]+=[^=\s]))?[^\s,;]+)"
+)
 _BEARER = re.compile(r"(?i)(\bbearer\s+)([A-Za-z0-9._~+/=-]+)")
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b")
 # Anchored and bounded: an unanchored "\b[...]+@" rescans from every word boundary, which is
@@ -44,8 +91,20 @@ _EMAIL = re.compile(
     r"(?<![A-Z0-9._%+-])[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,24}\b", re.IGNORECASE
 )
 _COMMON_TOKEN = re.compile(
-    r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b"
+    r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}"
+    r"|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}"
+    r"|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{36})\b"
 )
+# Values that carry diagnostic meaning rather than a credential. They are kept only in these
+# narrow cases; any other value under a secret-like key is masked.
+_NON_SECRET_WORD = re.compile(r"(?i)^(?:" + _STATUS_WORDS + r")$")
+_COUNT_KEY = re.compile(
+    r"(?i)(?:max_?tokens|tokens?_(?:used|count|total|limit|remaining)|tokens"
+    r"|_count|_days|_hours|_minutes|_seconds|_ms|_ttl|_length|_size|_limit)$"
+)
+_NUMBER_WITH_UNIT = re.compile(r"(?i)^\d+(?:\.\d+)?[a-z]{0,2}$")
+_PATH_VALUE = re.compile(r"^(?:/|~|[A-Za-z]:[\\/])")
+_KEY_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 _TOKEN = re.compile(r"[a-z0-9_./-]+", re.IGNORECASE)
 _ERROR_LINE = re.compile(
     r"(?i)\b(error|exception|failed|failure|timeout|timed out|refused|denied|critical|fatal| 5\d\d )\b"
@@ -77,11 +136,14 @@ def redact_sensitive_text(text: str) -> str:
     Line count is preserved so log evidence line numbers still match the uploaded file.
     """
     text = _PRIVATE_KEY_BLOCK.sub(_replace_private_key, text)
-    text = _AUTHORIZATION.sub(r"\1[REDACTED]", text)
+    text = _AUTHORIZATION.sub(_replace_value, text)
     text = _BEARER.sub(r"\1[REDACTED]", text)
     text = _COOKIE_HEADER.sub(r"\1[REDACTED]", text)
     text = _URL_CREDENTIALS.sub(r"\1[REDACTED]@", text)
+    text = _CLI_SECRET_FLAG.sub(r"\1[REDACTED]", text)
+    text = _MYSQL_PASSWORD_FLAG.sub(r"\1[REDACTED]", text)
     text = _SECRET_ASSIGNMENT.sub(_replace_secret_assignment, text)
+    text = _EXACT_SECRET_KEY.sub(_replace_secret_assignment, text)
     text = _SECRET_IN_PROSE.sub(r"\1[REDACTED]", text)
     text = _JWT.sub("[REDACTED_JWT]", text)
     text = _COMMON_TOKEN.sub("[REDACTED_TOKEN]", text)
@@ -94,7 +156,23 @@ def _replace_private_key(match: re.Match[str]) -> str:
     return "[REDACTED_PRIVATE_KEY]" + "\n" * match.group(0).count("\n")
 
 
+def _is_diagnostic_value(key: str, value: str) -> bool:
+    bare = value.strip("\"'")
+    if _NON_SECRET_WORD.match(bare):
+        return True
+    if _COUNT_KEY.search(key) and _NUMBER_WITH_UNIT.match(bare):
+        return True
+    return key.lower() in {"pwd", "oldpwd"} and bool(_PATH_VALUE.match(bare))
+
+
 def _replace_secret_assignment(match: re.Match[str]) -> str:
+    key = _KEY_NAME.search(match.group(1))
+    if key and _is_diagnostic_value(key.group(0), match.group(2)):
+        return match.group(0)
+    return _replace_value(match)
+
+
+def _replace_value(match: re.Match[str]) -> str:
     value = match.group(2)
     if value.startswith('"') and value.endswith('"'):
         replacement = '"[REDACTED]"'
@@ -129,6 +207,11 @@ def validate_uploaded_log(filename: str, raw_bytes: bytes) -> ValidatedUpload:
     if control_count / max(1, len(decoded)) > 0.02:
         raise InputValidationError("The uploaded file appears to contain binary data.")
     return ValidatedUpload(filename=basename, text=redact_sensitive_text(decoded))
+
+
+def is_error_line(text: str) -> bool:
+    """True for log lines that report a failure (ERROR, FATAL, timeout, refused, 5xx, ...)."""
+    return bool(_ERROR_LINE.search(text))
 
 
 def make_incident_evidence(description: str) -> EvidenceRecord:

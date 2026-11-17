@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,11 @@ INDEX_VERSION = "1"
 COLLECTION_PREFIX = "incident_kb"
 MAX_CHUNK_CHARS = 1800
 CHUNK_OVERLAP_CHARS = 250
+# Chroma's anonymized product telemetry is on by default; this demo keeps all index activity local.
+_CHROMA_SETTINGS = chromadb.Settings(anonymized_telemetry=False)
+# Streamlit sessions share one process, so this serializes concurrent rebuilds from different
+# browser tabs. It does not protect against two separate processes using the same directory.
+_REBUILD_LOCK = threading.Lock()
 
 
 class IndexErrorSafe(RuntimeError):
@@ -158,7 +164,7 @@ def open_active_collection(
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
 ) -> tuple[chromadb.ClientAPI, Any | None, dict[str, Any] | None]:
     try:
-        client = chromadb.PersistentClient(path=str(persist_dir))
+        client = open_persistent_client(persist_dir)
     except Exception as exc:
         raise IndexErrorSafe("The local semantic index could not be opened. Check the index directory or rebuild it.") from exc
     manifest = _read_manifest(persist_dir)
@@ -171,6 +177,11 @@ def open_active_collection(
     except Exception as exc:
         raise IndexErrorSafe("The active local knowledge index is unavailable. Rebuild it.") from exc
     return client, collection, manifest
+
+
+def open_persistent_client(persist_dir: str | Path) -> chromadb.ClientAPI:
+    """Open the local index with the app's settings; every caller must use the same settings."""
+    return chromadb.PersistentClient(path=str(persist_dir), settings=_CHROMA_SETTINGS)
 
 
 def _corpus_fingerprint(chunks: list[DocumentChunk], embedding_model: str) -> str:
@@ -187,15 +198,51 @@ def rebuild_index(
     client,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
 ) -> IndexStats:
+    with _REBUILD_LOCK:
+        return _rebuild_index_locked(
+            knowledge_dir=knowledge_dir,
+            persist_dir=persist_dir,
+            client=client,
+            embedding_model=embedding_model,
+        )
+
+
+def _delete_inactive_collections(chroma_client, active_name: str) -> None:
+    """Remove staged collections left behind by an earlier crash or failed cleanup."""
+    try:
+        collections = chroma_client.list_collections()
+    except Exception:
+        return
+    for collection in collections:
+        name = getattr(collection, "name", collection)
+        if isinstance(name, str) and name.startswith(f"{COLLECTION_PREFIX}_") and name != active_name:
+            try:
+                chroma_client.delete_collection(name=name)
+            except Exception:
+                pass
+
+
+def _rebuild_index_locked(
+    *,
+    knowledge_dir: str | Path,
+    persist_dir: str | Path,
+    client,
+    embedding_model: str,
+) -> IndexStats:
     chunks = load_chunks(knowledge_dir)
     if not chunks:
         raise IndexErrorSafe("No non-empty .txt or .md knowledge documents were found; the existing index was kept.")
 
     try:
-        chroma_client = chromadb.PersistentClient(path=str(persist_dir))
+        chroma_client = open_persistent_client(persist_dir)
     except Exception as exc:
         raise IndexErrorSafe("The local semantic index could not be opened. Check the index directory.") from exc
-    manifest = _read_manifest(persist_dir)
+    try:
+        manifest = _read_manifest(persist_dir)
+    except IndexErrorSafe:
+        # An unreadable manifest is recovered by staging a complete replacement; the atomic manifest
+        # write below overwrites it, and unreferenced collections are removed afterwards.
+        manifest = None
     old_collection = None
     compatible_old = False
     old_rows: dict[str, dict[str, Any]] = {}
@@ -290,12 +337,9 @@ def rebuild_index(
             raise
         raise IndexErrorSafe("The new knowledge index could not be saved; the previous active index remains available.") from exc
 
-    if manifest and manifest.get("collection_name") != staged_name:
-        try:
-            chroma_client.delete_collection(name=manifest["collection_name"])
-        except Exception:
-            # The active manifest already points at the completed staged collection.
-            pass
+    # The manifest now points at the staged collection, so the previous active collection and any
+    # orphans from earlier interrupted rebuilds can go. Failures here leave only unused data.
+    _delete_inactive_collections(chroma_client, staged_name)
     return IndexStats(staged_name, len(chunks), skipped, added, updated, stale)
 
 
@@ -311,7 +355,7 @@ def index_status(
         and manifest.get("index_version") == INDEX_VERSION
     )
     try:
-        client = chromadb.PersistentClient(path=str(persist_dir))
+        client = open_persistent_client(persist_dir)
         collection = client.get_collection(name=manifest["collection_name"])
         indexed = collection.get(include=["metadatas"])
         indexed_by_id = {chunk_id: metadata for chunk_id, metadata in zip(indexed["ids"], indexed["metadatas"], strict=True)}

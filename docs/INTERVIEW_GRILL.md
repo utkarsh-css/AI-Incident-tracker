@@ -12,12 +12,12 @@ Practice a concise explanation in your own words. Cover the user problem, end-to
 - Knowledge ingestion: local UTF-8 `.txt` and `.md` files in `knowledge_base/`; uploads and incident logs are excluded from the persistent index.
 - Chunking: maximum 1,800 characters with 250-character overlap; deterministic IDs based on source path and chunk number; content hashes detect changed text.
 - Index: Chroma `PersistentClient`; vectors are created explicitly through the configured OpenAI client, using `text-embedding-3-small` by default. Rebuild is user-triggered.
-- Retrieval: BM25Plus over the incident plus selected sanitized log excerpts; dense Chroma search embeds the incident description; reciprocal-rank fusion; up to three passages.
-- Retrieval defaults: five lexical and five dense candidates, a keyword candidate must share at least two distinct non-stop-word terms with the chunk (BM25Plus scores alone are positive for every chunk), cosine similarity cutoff 0.35, RRF constant 60, fused-score cutoff 0.016.
+- Retrieval: BM25Plus over the incident plus selected sanitized log excerpts; dense Chroma search embeds the incident description plus failure-reporting log lines; reciprocal-rank fusion; up to three passages.
+- Retrieval defaults: five lexical and five dense candidates, a keyword candidate must share at least two distinct non-stop-word terms from the incident description and failure-reporting log lines with the chunk, scaling to 10% of those distinct terms with a cap of four (BM25Plus scores alone are positive for every chunk; routine log lines only rerank), cosine similarity cutoff 0.35, RRF constant 60, fused-score cutoff 0.016.
 - Responses distinguish observable facts from potential causes, diagnostic steps, and suggested resolution. App-created IDs point to the exact incident/log excerpts or knowledge chunks; unknown IDs are rejected.
 - Safety: no commands run, no remediation, no incident persistence, best-effort redaction, explicit user actions for analysis and reindexing, safe error messages.
-- Evaluation: 18 local query cases, including three off-topic IT negatives that share vocabulary with the corpus. Live evaluation needs an explicit `--live` invocation and sends embedding requests. It has not been run as part of the mocked test suite.
-- Verification to date: 79 automated tests passed on Python 3.14.5; Chroma emits one dependency deprecation warning. Other declared Python versions and live API behavior have not been verified locally.
+- Evaluation: 20 local query cases, including three off-topic IT negatives that share vocabulary with the corpus and two cases with an attached log. Live evaluation needs an explicit `--live` invocation and sends embedding requests. It has not been run as part of the mocked test suite.
+- Verification to date: 139 automated tests passed on Python 3.14.5; Chroma emits one dependency deprecation warning. Other declared Python versions and live API behavior have not been verified locally.
 
 ## How to use this guide
 
@@ -164,7 +164,7 @@ Practice a concise explanation in your own words. Cover the user problem, end-to
 
 94. **Core:** What do Recall@3, MRR, and false-positive rate measure here?
 95. Why do you need both positive and unrelated/no-evidence evaluation cases?
-96. What does the 18-case set fail to tell you?
+96. What does the 20-case set fail to tell you?
 97. Why are automated tests mocked, and what integration risk does that leave?
 98. Which tests cover deterministic chunk IDs, embedding failure, stale deletion, and reference validation?
 99. How would you test whether an answer is factually useful, not just well-formed?

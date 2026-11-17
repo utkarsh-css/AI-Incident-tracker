@@ -1,9 +1,32 @@
+# Local secrets and environment files (keep only the template)
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Virtual environments
 .venv/
 venv/
+
+# Python caches and tool output
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.streamlit/secrets.toml
-data/chroma/
-data/*_active_index.json
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Local index state: Chroma vectors, the active-index manifest and its .tmp file
+data/
+
+# Uploaded or sample logs kept locally (may contain real operational data)
+*.log
+
+# Editor, OS and local assistant settings
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.claude/settings.local.json

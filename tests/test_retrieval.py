@@ -217,3 +217,96 @@ def test_missing_index_uses_bm25_without_embedding_call(tmp_path, monkeypatch):
     assert outcome.mode == "bm25"
     assert outcome.passages
 
+
+
+def test_log_noise_cannot_qualify_a_passage_without_incident_terms():
+    noise = "INFO request completed request id latency 12ms " * 20
+    matches = keyword_search(
+        "printer jam " + noise, "knowledge_base", relevance_query="printer jam"
+    )
+    assert matches == []
+
+
+def test_log_terms_still_rerank_passages_that_qualify_on_incident_terms(tmp_path):
+    (tmp_path / "a.txt").write_text("Database connection timeout. Check pool saturation.", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("Database connection timeout. Check DNS resolution.", encoding="utf-8")
+    matches = keyword_search(
+        "database connection timeout dns resolution dns",
+        tmp_path,
+        relevance_query="database connection timeout",
+    )
+    assert [match.source_path for match in matches] == ["b.txt", "a.txt"]
+
+
+def test_required_term_matches_scales_with_description_length_and_is_capped():
+    from incident_assistant.retrieval import required_term_matches
+
+    assert [required_term_matches(n) for n in (1, 5, 20, 25, 31, 500)] == [2, 2, 2, 3, 4, 4]
+
+
+def test_long_relevant_description_still_matches_but_long_off_topic_does_not():
+    padding = " ".join(f"word{i}" for i in range(200))
+    relevant = "Billing database connection timeouts affect two application instances. " + padding
+    off_topic = "The printer on floor three reports an error and the request failed. " + padding
+    assert [m.source_path for m in keyword_search(relevant, "knowledge_base")] == ["database_connectivity.txt"]
+    assert keyword_search(off_topic, "knowledge_base") == []
+
+
+def _queries_for(incident, log_text):
+    from incident_assistant.retrieval import build_retrieval_queries
+    from incident_assistant.validation import ValidatedUpload, make_log_evidence
+
+    return build_retrieval_queries(incident, make_log_evidence(ValidatedUpload("t.log", log_text), incident))
+
+
+def test_error_log_lines_count_toward_relevance_but_info_lines_do_not():
+    queries = _queries_for(
+        "Billing is down, see attached log.",
+        "INFO billing worker started\nERROR database connection timeout after 30000ms\n",
+    )
+    assert "ERROR database connection timeout" in queries.relevance
+    assert "INFO billing worker started" not in queries.relevance
+    assert "INFO billing worker started" in queries.lexical
+
+
+def test_short_description_with_informative_error_log_retrieves_guidance():
+    queries = _queries_for(
+        "Billing is down, see attached log.",
+        "INFO billing worker started\n"
+        "ERROR database connection timeout after 30000ms pool=20/20\n"
+        "ERROR connection pool exhausted; waiting for available connection\n",
+    )
+    matches = keyword_search(queries.lexical, "knowledge_base", relevance_query=queries.relevance)
+    assert [match.source_path for match in matches][:1] == ["database_connectivity.txt"]
+
+
+def test_off_topic_description_with_routine_log_lines_retrieves_nothing():
+    queries = _queries_for(
+        "The office printer shows a paper jam",
+        "INFO request completed request id latency 12ms\n" * 20,
+    )
+    assert keyword_search(queries.lexical, "knowledge_base", relevance_query=queries.relevance) == []
+
+
+def test_retrieve_for_incident_embeds_the_relevance_query(tmp_path, monkeypatch):
+    (tmp_path / "doc.txt").write_text("Database connection timeout guidance.", encoding="utf-8")
+    embedded = []
+    monkeypatch.setattr(
+        "incident_assistant.retrieval.open_active_collection",
+        lambda *args, **kwargs: (None, FakeCollection([]), {"collection_name": "present"}),
+    )
+    monkeypatch.setattr(
+        "incident_assistant.retrieval.embed_query",
+        lambda client, text, **kwargs: embedded.append(text) or [0.1, 0.2],
+    )
+    queries = _queries_for("Billing is down.", "ERROR database connection timeout\nINFO noise line\n")
+    retrieve_for_incident(
+        query=queries.relevance,
+        lexical_query=queries.lexical,
+        knowledge_dir=tmp_path,
+        persist_dir=tmp_path / "index",
+        client=object(),
+        embedding_model="text-embedding-3-small",
+    )
+    assert embedded == [queries.relevance]
+    assert "INFO noise line" not in embedded[0]

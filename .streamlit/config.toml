@@ -1,0 +1,14 @@
+# Local-only demo defaults. `streamlit run app.py` reads this file from the project root.
+
+[server]
+# Listen only on this machine. Without this, Streamlit listens on all interfaces and anyone on the
+# network could use the configured API key's quota.
+address = "127.0.0.1"
+maxUploadSize = 1
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Show only the exception type for unexpected errors; expected errors are mapped to safe messages.
+showErrorDetails = "type"

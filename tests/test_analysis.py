@@ -90,8 +90,10 @@ def test_valid_result_uses_real_application_evidence_records():
     assert result.analysis.category == "Database"
     assert {record.evidence_id for record in result.evidence} == {"I1", "L1", "K1"}
     assert client.responses.calls[0]["text_format"] is IncidentAnalysis
-    assert client.responses.calls[0]["max_output_tokens"] == 2000
+    assert client.responses.calls[0]["max_output_tokens"] == 4000
+    assert "reasoning" not in client.responses.calls[0]
     payload = json.loads(client.responses.calls[0]["input"][1]["content"])
+    assert "incident_description" not in payload
     assert payload["incident_description_evidence"]["evidence_id"] == "I1"
     assert [item["evidence_id"] for item in payload["uploaded_log_evidence"]] == ["L1"]
     assert [item["evidence_id"] for item in payload["knowledge_passages"]] == ["K1"]
@@ -174,3 +176,27 @@ def test_api_failures_map_to_safe_messages(error, expected):
         call(FakeClient(error=error))
     assert expected in str(exc_info.value)
     assert "private internal detail" not in str(exc_info.value)
+
+
+def test_reasoning_effort_is_sent_when_configured():
+    client = FakeClient(SimpleNamespace(output_parsed=valid_analysis(), output=[]))
+    call(client, reasoning_effort="low")
+    assert client.responses.calls[0]["reasoning"] == {"effort": "low"}
+
+
+def test_output_token_exhaustion_gets_a_specific_message():
+    response = SimpleNamespace(
+        output=[], output_parsed=None, status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+    )
+    with pytest.raises(InvalidModelResponseError, match="ran out of output tokens"):
+        call(FakeClient(response))
+
+
+def test_content_filter_stop_is_reported_as_refusal():
+    response = SimpleNamespace(
+        output=[], output_parsed=None, status="incomplete",
+        incomplete_details=SimpleNamespace(reason="content_filter"),
+    )
+    with pytest.raises(ModelRefusalError, match="content filter"):
+        call(FakeClient(response))

@@ -11,11 +11,17 @@ import streamlit as st
 from incident_assistant.analysis import (
     AnalysisError,
     analyze_incident,
+    create_client,
 )
 from incident_assistant.config import load_settings
 from incident_assistant.embeddings import EmbeddingError
 from incident_assistant.indexing import IndexErrorSafe, index_status, rebuild_index
-from incident_assistant.retrieval import keyword_search, retrieve_for_incident
+from incident_assistant.retrieval import (
+    MIN_LEXICAL_TERM_MATCHES,
+    build_retrieval_queries,
+    keyword_search,
+    retrieve_for_incident,
+)
 from incident_assistant.validation import (
     InputValidationError,
     MAX_INCIDENT_CHARS,
@@ -29,6 +35,13 @@ from incident_assistant.validation import (
 
 ROOT = Path(__file__).resolve().parent
 KNOWLEDGE_DIR = ROOT / "knowledge_base"
+_ANALYSIS_STATE_KEYS = (
+    "analysis_result",
+    "analysis_signature",
+    "retrieved_passages",
+    "retrieval_mode",
+    "retrieval_warning",
+)
 
 SAMPLES = {
     "Database connection timeouts": "Since 10:15 UTC, the billing service has intermittently timed out while opening database connections. The issue affects two of four application instances. No recent deployment is confirmed yet.",
@@ -46,8 +59,19 @@ def _set_sample() -> None:
     sample_text = get_sample_incident(sample_name)
     if sample_text is not None:
         st.session_state["incident_input"] = sample_text
-        st.session_state.pop("analysis_result", None)
-        st.session_state.pop("analysis_signature", None)
+        _clear_analysis_state()
+
+
+def _clear_analysis_state() -> None:
+    for key in _ANALYSIS_STATE_KEYS:
+        st.session_state.pop(key, None)
+
+
+def _cited_evidence_ids(analysis) -> set[str]:
+    cited: set[str] = set()
+    for item in [*analysis.observable_facts, *analysis.potential_causes, *analysis.diagnostic_steps]:
+        cited.update(item.evidence_ids)
+    return cited
 
 
 def _render_analysis(result) -> None:
@@ -96,11 +120,20 @@ def _render_analysis(result) -> None:
         st.write("No additional limitations were returned.")
 
 
-def _render_evidence(records) -> None:
-    st.markdown("#### Supporting evidence")
-    if not records:
-        st.info("No supporting evidence was selected.")
-        return
+def _render_evidence(records, cited_ids: set[str]) -> None:
+    cited = [record for record in records if record.evidence_id in cited_ids]
+    uncited = [record for record in records if record.evidence_id not in cited_ids]
+    st.markdown("#### Cited evidence")
+    if cited:
+        _render_evidence_records(cited)
+    else:
+        st.info("The analysis did not cite any evidence record.")
+    if uncited:
+        st.markdown("#### Other evidence supplied to the model (not cited)")
+        _render_evidence_records(uncited)
+
+
+def _render_evidence_records(records) -> None:
     for record in records:
         location = ""
         if record.line_start is not None:
@@ -129,7 +162,11 @@ def main() -> None:
         "Use synthetic or appropriately sanitized information; secret detection is best-effort."
     )
 
-    api_key, model, embedding_model, persist_dir = load_settings()
+    settings = load_settings()
+    api_key = settings.api_key
+    model = settings.chat_model
+    embedding_model = settings.embedding_model
+    persist_dir = settings.persist_dir
     if not api_key:
         st.warning(
             "Analysis is disabled because OPENAI_API_KEY is not configured. "
@@ -143,7 +180,7 @@ def main() -> None:
     st.subheader("Describe the incident")
     sample_col, button_col = st.columns([3, 1])
     sample_col.selectbox("Load a sample incident", ["Choose a sample…", *SAMPLES], key="sample_choice")
-    button_col.button("Load sample", on_click=_set_sample, use_container_width=True)
+    button_col.button("Load sample", on_click=_set_sample, width="stretch")
 
     incident_raw = st.text_area(
         "Incident description",
@@ -172,20 +209,31 @@ def main() -> None:
 
     log_evidence = []
     passages = []
+    queries = build_retrieval_queries("", [])
+    knowledge_error = None
     if incident_text and validation_error is None:
         log_evidence = make_log_evidence(validated_upload, incident_text)
-        retrieval_query = " ".join(
-            [incident_text, *(record.excerpt for record in log_evidence)]
-        )
-        passages = keyword_search(retrieval_query, KNOWLEDGE_DIR)
+        queries = build_retrieval_queries(incident_text, log_evidence)
+        try:
+            passages = keyword_search(
+                queries.lexical, KNOWLEDGE_DIR, relevance_query=queries.relevance
+            )
+        except IndexErrorSafe as exc:
+            knowledge_error = str(exc)
 
     st.subheader("Retrieved troubleshooting knowledge")
     if validation_error:
         st.caption("Correct the input above to retrieve local guidance.")
     elif not incident_text:
         st.caption("Enter an incident description to search the local knowledge base.")
+    elif knowledge_error:
+        st.error(f"{knowledge_error} Fix or remove the file in knowledge_base/ to enable retrieval and analysis.")
     elif not passages:
-        st.info("No knowledge passage met the relevance threshold. The analysis will be asked to state this limitation.")
+        st.info(
+            f"No knowledge passage shares at least {MIN_LEXICAL_TERM_MATCHES} terms with the incident. "
+            "Semantic search may still find guidance when you analyze; otherwise the analysis will "
+            "state that no knowledge evidence was retrieved."
+        )
     else:
         for passage in passages:
             with st.expander(f"{passage.evidence_id} · {passage.source_name} · {passage.passage_id}"):
@@ -211,6 +259,11 @@ def main() -> None:
         current_index_status = {"indexed": False, "stale": True}
         st.warning(str(exc))
 
+    # A rebuild reruns the script to refresh the status above, so its outcome is shown from state.
+    index_notice = st.session_state.pop("index_notice", None)
+    if index_notice:
+        st.success(index_notice)
+
     index_clicked = st.button(
         "Rebuild knowledge index",
         disabled=not bool(api_key),
@@ -219,7 +272,7 @@ def main() -> None:
     if index_clicked:
         try:
             with st.spinner("Updating the local semantic index…"):
-                with openai.OpenAI(api_key=api_key, max_retries=0, timeout=45.0) as embedding_client:
+                with create_client(api_key) as embedding_client:
                     stats = rebuild_index(
                         knowledge_dir=KNOWLEDGE_DIR,
                         persist_dir=persist_dir,
@@ -227,13 +280,14 @@ def main() -> None:
                         embedding_model=embedding_model,
                     )
             if stats.unchanged:
-                st.success(f"Index is already current: {stats.total_chunks} chunks; no embedding calls were needed.")
+                notice = f"Index is already current: {stats.total_chunks} chunks; no embedding calls were needed."
             else:
-                st.success(
+                notice = (
                     f"Index updated: {stats.total_chunks} chunks; {stats.added_chunks} added, "
                     f"{stats.updated_chunks} updated, {stats.skipped_chunks} unchanged, "
                     f"{stats.stale_chunks} stale removed."
                 )
+            st.session_state["index_notice"] = notice
             st.rerun()
         except (IndexErrorSafe, EmbeddingError) as exc:
             st.error(str(exc))
@@ -242,7 +296,7 @@ def main() -> None:
         except Exception:
             st.error("The local knowledge index could not be updated. The active index remains available.")
 
-    can_analyze = bool(api_key and incident_text and validation_error is None)
+    can_analyze = bool(api_key and incident_text and validation_error is None and knowledge_error is None)
     analyze_clicked = st.button(
         "Analyze incident",
         type="primary",
@@ -258,6 +312,10 @@ def main() -> None:
             + "\0"
             + model
             + "\0"
+            + embedding_model
+            + "\0"
+            + str(settings.reasoning_effort)
+            + "\0"
             + str(current_index_status.get("indexed_chunks", 0))
             + "\0"
             + str(current_index_status.get("stale", True))
@@ -266,37 +324,37 @@ def main() -> None:
         ).encode("utf-8")
     ).hexdigest()
     if analyze_clicked:
-        st.session_state.pop("analysis_result", None)
-        st.session_state.pop("analysis_signature", None)
+        _clear_analysis_state()
         try:
             with st.spinner("Analyzing the incident…"):
-                with openai.OpenAI(api_key=api_key, max_retries=0, timeout=45.0) as analysis_client:
+                with create_client(api_key) as analysis_client:
                     retrieval = retrieve_for_incident(
-                        query=incident_text,
-                        lexical_query=retrieval_query,
+                        query=queries.relevance,
+                        lexical_query=queries.lexical,
                         knowledge_dir=KNOWLEDGE_DIR,
                         persist_dir=persist_dir,
                         client=analysis_client,
                         embedding_model=embedding_model,
                     )
                     selected_passages = retrieval.passages
-                    if retrieval.warning:
-                        st.warning(retrieval.warning)
-                    if not selected_passages:
-                        st.info("No relevant knowledge evidence was retrieved for this incident.")
                     result = analyze_incident(
                         incident_text=incident_text,
                         log_evidence=log_evidence,
                         passages=selected_passages,
                         api_key=api_key,
                         model=model,
+                        reasoning_effort=settings.reasoning_effort,
                         client=analysis_client,
                     )
-                st.session_state["retrieved_passages"] = selected_passages
-                st.session_state["retrieval_mode"] = retrieval.mode
-            st.session_state["analysis_result"] = result
-            st.session_state["analysis_signature"] = signature
-        except AnalysisError as exc:
+                    # Store the paid result before any further Streamlit call: a click or keystroke
+                    # during analysis stops this run at the next st.* call (including leaving the
+                    # spinner), and the result would otherwise be lost.
+                    st.session_state["retrieved_passages"] = selected_passages
+                    st.session_state["retrieval_mode"] = retrieval.mode
+                    st.session_state["retrieval_warning"] = retrieval.warning
+                    st.session_state["analysis_result"] = result
+                    st.session_state["analysis_signature"] = signature
+        except (AnalysisError, IndexErrorSafe) as exc:
             st.error(str(exc))
         except openai.OpenAIError:
             st.error("Could not initialize or use the OpenAI API client. Check the API configuration and connection.")
@@ -304,25 +362,35 @@ def main() -> None:
     result = st.session_state.get("analysis_result")
     result_signature = st.session_state.get("analysis_signature")
     if result is not None and result_signature == signature:
-        _render_analysis(result)
-        records = [*result.evidence]
-        _render_evidence(records)
+        mode = st.session_state.get("retrieval_mode", "bm25")
+        retrieval_warning = st.session_state.get("retrieval_warning")
+        if mode == "hybrid":
+            st.caption("Knowledge retrieval mode: hybrid (BM25 + semantic search).")
+        else:
+            st.warning(
+                "Knowledge retrieval mode: BM25 keyword fallback only; semantic search was not used."
+                + (f" {retrieval_warning}" if retrieval_warning else "")
+            )
         retrieved = st.session_state.get("retrieved_passages", [])
+        if not retrieved:
+            st.info("No relevant knowledge evidence was retrieved for this incident.")
+        _render_analysis(result)
+        _render_evidence(result.evidence, _cited_evidence_ids(result.analysis))
         if retrieved:
-            st.markdown("#### Hybrid retrieval scores")
+            st.markdown("#### Retrieval scores")
             for passage in retrieved:
-                similarity = (
-                    f"{passage.semantic_similarity:.3f}"
-                    if passage.semantic_similarity is not None
-                    else "BM25 fallback"
-                )
+                if passage.semantic_similarity is not None:
+                    similarity = f"{passage.semantic_similarity:.3f}"
+                elif mode == "hybrid":
+                    similarity = "no dense match"
+                else:
+                    similarity = "not used"
                 st.caption(
                     f"{passage.source_path} · BM25 {passage.bm25_score:.3f} · "
                     f"semantic {similarity} · RRF {passage.fused_score:.4f}"
                 )
     elif result is not None:
-        st.session_state.pop("analysis_result", None)
-        st.session_state.pop("analysis_signature", None)
+        _clear_analysis_state()
 
     if validated_upload and log_evidence:
         with st.expander(f"Sanitized log excerpts used as evidence ({len(log_evidence)})"):

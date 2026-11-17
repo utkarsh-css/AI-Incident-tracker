@@ -1,13 +1,16 @@
 from types import SimpleNamespace
 
-import chromadb
+import json
+
 import pytest
 
 from incident_assistant.embeddings import EmbeddingError
 from incident_assistant.indexing import (
     IndexErrorSafe,
+    IndexCompatibilityError,
     index_status,
     open_active_collection,
+    open_persistent_client,
     rebuild_index,
 )
 
@@ -119,7 +122,7 @@ def test_embedding_failure_keeps_existing_active_index(tmp_path):
             client=FakeEmbeddingClient(fail=True),
         )
     assert manifest_path.read_text(encoding="utf-8") == old_manifest
-    chroma_client = chromadb.PersistentClient(path=str(persist))
+    chroma_client = open_persistent_client(persist)
     active = chroma_client.get_collection(old_collection_name)
     assert active.get(include=["documents"])["documents"] == ["Original source."]
 
@@ -153,3 +156,64 @@ def test_empty_corpus_does_not_clear_existing_index(tmp_path):
         rebuild_index(knowledge_dir=kb, persist_dir=persist, client=FakeEmbeddingClient())
     _, collection, _ = open_active_collection(persist)
     assert collection.count() == 1
+
+
+def _collection_names(persist):
+    return {getattr(item, "name", item) for item in open_persistent_client(persist).list_collections()}
+
+
+def test_chroma_telemetry_is_disabled(tmp_path):
+    client = open_persistent_client(tmp_path / "chroma")
+    assert client.get_settings().anonymized_telemetry is False
+
+
+def test_corrupt_manifest_raises_safe_error(tmp_path):
+    persist = tmp_path / "data" / "chroma"
+    persist.parent.mkdir(parents=True)
+    (persist.parent / "chroma_active_index.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(IndexErrorSafe, match="unreadable"):
+        open_active_collection(persist)
+
+
+def test_embedding_model_mismatch_is_reported_as_incompatible(tmp_path):
+    _, persist, _, _ = create_index(tmp_path)
+    with pytest.raises(IndexCompatibilityError):
+        open_active_collection(persist, embedding_model="text-embedding-3-large")
+
+
+def test_staging_write_failure_keeps_existing_active_index(tmp_path, monkeypatch):
+    kb, persist, _, _ = create_index(tmp_path)
+    manifest_path = persist.parent / "chroma_active_index.json"
+    old_manifest = manifest_path.read_text(encoding="utf-8")
+    (kb / "guide.txt").write_text("Changed passage that must be re-embedded.", encoding="utf-8")
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("incident_assistant.indexing._write_manifest", fail_write)
+    with pytest.raises(IndexErrorSafe, match="previous active index remains"):
+        rebuild_index(knowledge_dir=kb, persist_dir=persist, client=FakeEmbeddingClient())
+    assert manifest_path.read_text(encoding="utf-8") == old_manifest
+    _, collection, _ = open_active_collection(persist)
+    assert collection.get(include=["documents"])["documents"] == ["Default test passage."]
+    assert _collection_names(persist) == {json.loads(old_manifest)["collection_name"]}
+
+
+def test_successful_rebuild_removes_orphaned_staged_collections(tmp_path):
+    kb, persist, _, _ = create_index(tmp_path)
+    open_persistent_client(persist).create_collection(name="incident_kb_orphan_from_crash")
+    (kb / "guide.txt").write_text("Updated passage.", encoding="utf-8")
+    stats = rebuild_index(knowledge_dir=kb, persist_dir=persist, client=FakeEmbeddingClient())
+    assert _collection_names(persist) == {stats.collection_name}
+
+
+def test_rebuild_recovers_from_corrupt_manifest(tmp_path):
+    kb, persist, _, _ = create_index(tmp_path)
+    old_name = json.loads((persist.parent / "chroma_active_index.json").read_text(encoding="utf-8"))["collection_name"]
+    (persist.parent / "chroma_active_index.json").write_text("{corrupt", encoding="utf-8")
+    stats = rebuild_index(knowledge_dir=kb, persist_dir=persist, client=FakeEmbeddingClient())
+    assert stats.added_chunks == 1
+    _, collection, manifest = open_active_collection(persist)
+    assert manifest["collection_name"] == stats.collection_name
+    assert collection.count() == 1
+    assert old_name not in _collection_names(persist)

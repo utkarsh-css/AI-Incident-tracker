@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import json
-import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 
 import openai
-from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from .retrieval import knowledge_evidence
@@ -17,7 +15,10 @@ from .validation import make_incident_evidence
 
 
 DEFAULT_MODEL = "gpt-6-luna"
+DEFAULT_REASONING_EFFORT = "low"
 REQUEST_TIMEOUT_SECONDS = 45.0
+# Reasoning tokens count against this limit, so it leaves room for reasoning plus the JSON answer.
+MAX_OUTPUT_TOKENS = 4000
 
 
 class AnalysisError(RuntimeError):
@@ -49,13 +50,16 @@ Use evidence IDs exactly as supplied. Never invent IDs, document names, log line
 If there is no relevant knowledge evidence, explicitly say so in evidence_limitations and provide cautious diagnostic checks. Suggested resolution must be conditional on confirmation and must not instruct the user to execute commands or modify systems automatically. Severity is an advisory assessment based only on the supplied information."""
 
 
-def load_settings() -> tuple[str | None, str]:
-    load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if api_key.lower() in {"", "replace-with-your-own-key", "your-api-key-here", "changeme"}:
-        api_key = ""
-    model = os.getenv("OPENAI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    return api_key or None, model
+def create_client(api_key: str) -> openai.OpenAI:
+    """One place for client options: no silent retries of paid calls, bounded wait."""
+    return openai.OpenAI(api_key=api_key, max_retries=0, timeout=REQUEST_TIMEOUT_SECONDS)
+
+
+def _incomplete_reason(response) -> str | None:
+    if getattr(response, "status", None) != "incomplete":
+        return None
+    details = getattr(response, "incomplete_details", None)
+    return getattr(details, "reason", None) or "unknown"
 
 
 def _is_refusal(response) -> bool:
@@ -73,7 +77,6 @@ def _request_payload(
 ) -> str:
     return json.dumps(
         {
-            "incident_description": incident_text,
             "incident_description_evidence": {
                 "evidence_id": "I1",
                 "kind": "incident_description",
@@ -119,6 +122,7 @@ def analyze_incident(
     passages: list[RetrievalResult],
     api_key: str | None,
     model: str = DEFAULT_MODEL,
+    reasoning_effort: str | None = None,
     client=None,
 ) -> AnalysisResult:
     if not api_key:
@@ -128,25 +132,20 @@ def analyze_incident(
     evidence.extend(knowledge_evidence(passages))
 
     try:
-        client_manager = (
-            openai.OpenAI(
-                api_key=api_key,
-                max_retries=0,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-            if client is None
-            else nullcontext(client)
-        )
+        request = {
+            "model": model,
+            "input": [
+                {"role": "developer", "content": SYSTEM_INSTRUCTIONS},
+                {"role": "user", "content": _request_payload(incident_text, log_evidence, passages)},
+            ],
+            "text_format": IncidentAnalysis,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+        }
+        if reasoning_effort:
+            request["reasoning"] = {"effort": reasoning_effort}
+        client_manager = create_client(api_key) if client is None else nullcontext(client)
         with client_manager as active_client:
-            response = active_client.responses.parse(
-                model=model,
-                input=[
-                    {"role": "developer", "content": SYSTEM_INSTRUCTIONS},
-                    {"role": "user", "content": _request_payload(incident_text, log_evidence, passages)},
-                ],
-                text_format=IncidentAnalysis,
-                max_output_tokens=2000,
-            )
+            response = active_client.responses.parse(**request)
     except openai.APITimeoutError as exc:
         raise AnalysisError("The analysis request timed out. You can try again.") from exc
     except openai.RateLimitError as exc:
@@ -159,8 +158,11 @@ def analyze_incident(
         else:
             message = "The OpenAI API could not complete the analysis. Check your configuration and try again."
         raise AnalysisError(message) from exc
-    except (openai.LengthFinishReasonError, ValidationError) as exc:
-        raise InvalidModelResponseError("The model response was incomplete or did not match the required format. Please retry analysis.") from exc
+    except ValidationError as exc:
+        # The SDK parses during the call, so a reply cut off at the token limit surfaces here too.
+        raise InvalidModelResponseError(
+            "The model response was cut off or did not match the required format. Please retry analysis."
+        ) from exc
     except openai.OpenAIError as exc:
         raise AnalysisError("The OpenAI API returned an error. Check the configuration and try again.") from exc
     except Exception as exc:
@@ -168,6 +170,16 @@ def analyze_incident(
 
     if _is_refusal(response):
         raise ModelRefusalError("The model declined this request. Review the input and try again if appropriate.")
+    incomplete_reason = _incomplete_reason(response)
+    if incomplete_reason == "max_output_tokens":
+        raise InvalidModelResponseError(
+            "The model ran out of output tokens before finishing the analysis. Retry, or set a lower "
+            "OPENAI_REASONING_EFFORT in .env."
+        )
+    if incomplete_reason == "content_filter":
+        raise ModelRefusalError("The response was stopped by the provider's content filter. Review the input.")
+    if incomplete_reason is not None:
+        raise InvalidModelResponseError("The model response was incomplete. Please retry analysis.")
 
     parsed = getattr(response, "output_parsed", None)
     if not isinstance(parsed, IncidentAnalysis):

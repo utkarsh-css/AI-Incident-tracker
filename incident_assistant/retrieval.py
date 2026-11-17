@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,10 +10,10 @@ from typing import Any
 
 from rank_bm25 import BM25Plus
 
-from .indexing import load_chunks
 from .embeddings import EmbeddingError, embed_query
-from .indexing import IndexErrorSafe, open_active_collection
+from .indexing import DocumentChunk, IndexErrorSafe, load_chunks, open_active_collection
 from .schemas import EvidenceRecord, RetrievalResult
+from .validation import is_error_line
 
 
 BM25_CANDIDATES = 5
@@ -25,6 +26,10 @@ MIN_FUSED_SCORE = 0.016
 # corpus, so "score > 0" is not a relevance signal. A keyword candidate must instead share at least
 # this many distinct non-stop-word terms with the chunk itself.
 MIN_LEXICAL_TERM_MATCHES = 2
+# ...or this fraction of the description's distinct terms, whichever is larger, capped so that a
+# long but relevant description can still qualify. All three values are uncalibrated.
+MIN_LEXICAL_TERM_FRACTION = 0.1
+MAX_REQUIRED_TERM_MATCHES = 4
 _TOKEN = re.compile(r"[a-z0-9_./-]+", re.IGNORECASE)
 _STOP_WORDS = {
     "a", "after", "all", "also", "an", "and", "any", "are", "as", "at", "be",
@@ -49,6 +54,30 @@ class RetrievalOutcome:
     warning: str | None = None
 
 
+@dataclass(frozen=True)
+class RetrievalQueries:
+    """The texts retrieval runs on, built from sanitized incident text and log evidence.
+
+    ``relevance`` decides whether a passage qualifies and is the dense (embedding) query: the
+    incident description plus log lines that report a failure. ``lexical`` ranks BM25 candidates
+    and also includes routine log lines, which may rerank passages but never qualify one alone.
+    """
+
+    relevance: str
+    lexical: str
+
+
+def build_retrieval_queries(
+    incident_text: str, log_evidence: list[EvidenceRecord]
+) -> RetrievalQueries:
+    excerpts = [record.excerpt for record in log_evidence]
+    error_excerpts = [excerpt for excerpt in excerpts if is_error_line(excerpt)]
+    return RetrievalQueries(
+        relevance=" ".join([incident_text, *error_excerpts]),
+        lexical=" ".join([incident_text, *excerpts]),
+    )
+
+
 def retrieve_for_incident(
     *,
     query: str,
@@ -58,7 +87,15 @@ def retrieve_for_incident(
     client,
     embedding_model: str,
 ) -> RetrievalOutcome:
-    keyword_results = keyword_search(lexical_query, knowledge_dir)
+    """Run hybrid retrieval: ``query`` gates and embeds, ``lexical_query`` ranks BM25.
+
+    Use ``build_retrieval_queries`` to build both. Raises IndexErrorSafe only when the knowledge
+    documents themselves cannot be read.
+    """
+    chunks = load_chunks(knowledge_dir)
+    keyword_results = keyword_search(
+        lexical_query, knowledge_dir, chunks=chunks, relevance_query=query
+    )
     try:
         _, collection, _ = open_active_collection(
             persist_dir, embedding_model=embedding_model
@@ -78,6 +115,8 @@ def retrieve_for_incident(
             knowledge_dir=knowledge_dir,
             collection=collection,
             query_embedding=vector,
+            chunks=chunks,
+            relevance_query=query,
         )
     except (EmbeddingError, RetrievalError) as exc:
         return RetrievalOutcome(keyword_results, "bm25", str(exc))
@@ -97,6 +136,12 @@ def knowledge_evidence(passages: list[RetrievalResult]) -> list[EvidenceRecord]:
     ]
 
 
+def required_term_matches(distinct_relevance_terms: int) -> int:
+    """A long description shares a few words with almost any passage, so the bar scales with it."""
+    scaled = math.ceil(MIN_LEXICAL_TERM_FRACTION * distinct_relevance_terms)
+    return max(MIN_LEXICAL_TERM_MATCHES, min(MAX_REQUIRED_TERM_MATCHES, scaled))
+
+
 def tokenize(text: str) -> list[str]:
     # Strip sentence punctuation so "timeouts." and "timeouts" are the same term; inner
     # separators (e.g. "identity-policy", "/api/v1") are kept.
@@ -109,19 +154,29 @@ def keyword_search(
     knowledge_dir: str | Path,
     *,
     max_results: int = MAX_RESULTS,
+    chunks: list[DocumentChunk] | None = None,
+    relevance_query: str | None = None,
 ) -> list[RetrievalResult]:
-    chunks = load_chunks(knowledge_dir)
+    """Rank chunks by BM25 over ``query``.
+
+    ``relevance_query`` (default: ``query``) decides which chunks qualify at all. The app passes
+    the incident description here, so that routine words in attached log lines ("request",
+    "latency") can rerank matches but cannot make an unrelated passage qualify on their own.
+    """
+    if chunks is None:
+        chunks = load_chunks(knowledge_dir)
     query_terms = tokenize(query)
-    if not chunks or not query_terms:
+    relevance_terms = set(tokenize(relevance_query if relevance_query is not None else query))
+    if not chunks or not query_terms or not relevance_terms:
         return []
+    required_matches = required_term_matches(len(relevance_terms))
     tokenized_docs = [tokenize(chunk.text) for chunk in chunks]
     scores = BM25Plus(tokenized_docs).get_scores(query_terms)
-    distinct_query_terms = set(query_terms)
     ranked = sorted(
         (
             (float(score), chunk)
             for score, chunk, doc_terms in zip(scores, chunks, tokenized_docs, strict=True)
-            if len(distinct_query_terms.intersection(doc_terms)) >= MIN_LEXICAL_TERM_MATCHES
+            if len(relevance_terms.intersection(doc_terms)) >= required_matches
         ),
         key=lambda item: (-item[0], item[1].source_path.lower(), item[1].chunk_index),
     )[:max_results]
@@ -146,13 +201,22 @@ def hybrid_search(
     collection: Any,
     query_embedding: list[float],
     max_results: int = MAX_RESULTS,
+    chunks: list[DocumentChunk] | None = None,
+    relevance_query: str | None = None,
 ) -> list[RetrievalResult]:
-    chunks = load_chunks(knowledge_dir)
+    if chunks is None:
+        chunks = load_chunks(knowledge_dir)
     if not chunks:
         return []
     current_by_id = {chunk.chunk_id: chunk for chunk in chunks}
 
-    keyword_candidates = keyword_search(query, knowledge_dir, max_results=BM25_CANDIDATES)
+    keyword_candidates = keyword_search(
+        query,
+        knowledge_dir,
+        max_results=BM25_CANDIDATES,
+        chunks=chunks,
+        relevance_query=relevance_query,
+    )
     bm25_rank = {item.chunk_id: rank for rank, item in enumerate(keyword_candidates, start=1)}
     bm25_by_id = {item.chunk_id: item for item in keyword_candidates}
 

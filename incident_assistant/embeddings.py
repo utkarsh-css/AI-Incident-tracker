@@ -7,7 +7,6 @@ import openai
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_BATCH_SIZE = 64
-EMBEDDING_TIMEOUT_SECONDS = 45.0
 
 
 class EmbeddingError(RuntimeError):

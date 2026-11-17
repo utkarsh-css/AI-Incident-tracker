@@ -18,6 +18,8 @@
     {"id": "none-03", "query": "What are the best hiking trails for a weekend camping trip?", "expected_sources": [], "acceptance_required": true},
     {"id": "none-it-01", "query": "The office printer shows a paper jam error on the third floor.", "expected_sources": [], "acceptance_required": true},
     {"id": "none-it-02", "query": "Disk usage on the file server reached 100 percent and nightly backups failed.", "expected_sources": [], "acceptance_required": true},
-    {"id": "none-it-03", "query": "A laptop battery will not charge after a firmware update.", "expected_sources": [], "acceptance_required": true}
+    {"id": "none-it-03", "query": "A laptop battery will not charge after a firmware update.", "expected_sources": [], "acceptance_required": true},
+    {"id": "log-01", "query": "Billing is down, see attached log.", "log": "2026-11-16T10:15:01Z INFO billing worker started\n2026-11-16T10:15:07Z ERROR database connection timeout after 30000ms pool=20/20\n2026-11-16T10:15:09Z ERROR connection pool exhausted; waiting for available connection\n", "expected_sources": ["database_connectivity.txt"], "acceptance_required": true},
+    {"id": "log-02", "query": "The office printer shows a paper jam.", "log": "2026-11-16T09:00:01Z INFO request completed request_id=a1 latency=12ms\n2026-11-16T09:00:02Z INFO request completed request_id=a2 latency=14ms\n2026-11-16T09:00:03Z INFO request completed request_id=a3 latency=11ms\n", "expected_sources": [], "acceptance_required": true}
   ]
 }
